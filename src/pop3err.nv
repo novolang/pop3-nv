@@ -1,0 +1,73 @@
+// pop3err.nv — the refusals a POP3 line, command or session can meet.
+//
+// A line that is cut short is not one of them: on a stream the caller
+// reads more bytes and the session waits.  Every variant here is a
+// fault in the bytes, in an argument or in the order of calls.
+
+use std.str
+
+// Why a line was not read, a command was not written or a call was not
+// allowed.
+pub enum Pop3Error
+    // A status line that begins with neither `+OK`, `-ERR` nor, during
+    // AUTH, `+` (RFC 1939 section 3, RFC 5034 section 4).
+    Pop3BadStatus(line: Str)
+    // A status line longer than 512 octets with its CRLF (RFC 2449
+    // section 4 and RFC 1939 section 3).  `length` counts the octets
+    // received before the line ended or the limit was passed.
+    Pop3StatusTooLong(length: Int)
+    // A multi-line response that has grown past the limit the session
+    // was given.
+    Pop3BodyTooLong(limit: Int)
+    // The text of a STAT answer is not two non-negative numbers.
+    Pop3BadStat(text: Str)
+    // A line of a LIST answer is not a message number and a size.
+    Pop3BadListLine(line: Str)
+    // A line of a UIDL answer is not a message number and a unique-id
+    // of 1 to 70 printable characters (RFC 1939 section 7).
+    Pop3BadUidlLine(line: Str)
+    // A capability line that is empty.
+    Pop3BadCapability(line: Str)
+    // An argument that holds a CR, an LF or a NUL, or is empty where the
+    // command needs one.  `what` names the argument.
+    Pop3BadArgument(what: Str)
+    // A command line longer than 255 octets with its CRLF (RFC 2449
+    // section 4).
+    Pop3CommandTooLong(length: Int)
+    // A message number below 1 or a line count below 0.
+    Pop3BadNumber(value: Int)
+    // A command that does not belong to the phase the session is in.
+    // `phase` is the name of the phase.
+    Pop3WrongState(command: Str, phase: Str)
+    // A command sent while the answer to the last one has not arrived.
+    Pop3Busy(command: Str)
+    // APOP asked for and the greeting carried no timestamp.
+    Pop3NoTimestamp
+    // A line from the server when no command was waiting for one.
+    Pop3Unsolicited(line: Str)
+    // A challenge or an initial response that is not base64.
+    Pop3BadBase64(text: Str)
+    // Bytes handed to a session that has ended.
+    Pop3Ended
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.  `Result<_, Pop3Error>` requires it.
+impl Error for Pop3Error
+    fn message(self) -> Str
+        match self
+            Pop3BadStatus(line)            => "the line \"" + line + "\" is not a POP3 status line"
+            Pop3StatusTooLong(length)      => "a status line of " + str.from_int(length) + " octets is over 512"
+            Pop3BodyTooLong(limit)         => "the response is longer than the limit of " + str.from_int(limit) + " octets"
+            Pop3BadStat(text)              => "\"" + text + "\" is not a message count and a size"
+            Pop3BadListLine(line)          => "\"" + line + "\" is not a message number and a size"
+            Pop3BadUidlLine(line)          => "\"" + line + "\" is not a message number and a unique-id"
+            Pop3BadCapability(line)        => "\"" + line + "\" is not a capability"
+            Pop3BadArgument(what)          => "the " + what + " is empty or holds a CR, an LF or a NUL"
+            Pop3CommandTooLong(length)     => "a command of " + str.from_int(length) + " octets is over 255"
+            Pop3BadNumber(value)           => str.from_int(value) + " is not a valid message number or line count"
+            Pop3WrongState(command, phase) => command + " is not allowed in the " + phase + " state"
+            Pop3Busy(command)              => command + " cannot be sent while the last command is unanswered"
+            Pop3NoTimestamp                => "the greeting carried no timestamp, so APOP cannot be used"
+            Pop3Unsolicited(line)          => "the line \"" + line + "\" arrived and no command was waiting"
+            Pop3BadBase64(text)            => "\"" + text + "\" is not base64"
+            Pop3Ended                      => "the session has ended"

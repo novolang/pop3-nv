@@ -1,0 +1,21 @@
+[package]
+name        = "pop3-nv"
+version     = "0.1.0"
+description = "POP3 (RFC 1939) as a codec and a client session with no socket: the commands, the +OK and -ERR replies with the response codes of RFC 2449, multi-line responses with byte-stuffing, APOP, CAPA, AUTH as a carrier of a SASL mechanism's bytes (RFC 5034) and STLS (RFC 2595) as a command the caller follows with its own TLS. A message is handed over as bytes."
+license     = "Apache-2.0"
+stability   = "experimental"
+layer       = "host"
+category    = "networking"
+tags        = ["pop3", "email", "rfc1939", "rfc2449", "rfc5034", "rfc2595", "apop", "sasl", "sans-io", "state-machine"]
+repository  = "https://github.com/novolang/pop3-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Reading a mailbox over POP3, without a socket"
+
+[dependencies]
+crypto-nv = "^0.1.8"

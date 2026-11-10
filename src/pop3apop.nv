@@ -1,0 +1,56 @@
+// pop3apop.nv — the APOP command of RFC 1939 section 7.
+//
+// A server that offers APOP puts a timestamp in its greeting, such as
+// `<1896.697170952@dbc.mtview.ca.us>`.  The client answers with the MD5
+// digest, in lower-case hex, of the timestamp followed by a shared
+// secret, and so proves it knows the secret without sending it.
+//
+// MD5 is here because the protocol specifies it.  APOP protects a
+// password from being read in transit and from nothing else; a client
+// that can use TLS and AUTH should.
+
+use std.bytes
+use std.str
+use hashing
+
+// Whether a token is shaped like the timestamp of section 7: inside the
+// angle brackets there is an `@` and there is no space, CR, LF or NUL.
+fn shaped(token: Str) -> Bool
+    str.contains(token, "@") and not str.contains(token, " ") and not str.contains(token, "\r")
+        and not str.contains(token, "\n") and not str.contains(token, str.from_byte(0))
+
+// The timestamp in a greeting, with its angle brackets, or "" when the
+// greeting has none.  It is the first `<` and the first `>` after it.
+//
+// ```novo
+// use pop3apop
+//
+// fn main() [io]
+//     let greeting = "POP3 server ready <1896.697170952@dbc.mtview.ca.us>"
+//     println(pop3apop.timestamp_of(greeting))   // <1896.697170952@dbc.mtview.ca.us>
+// ```
+pub fn timestamp_of(greeting: Str) -> Str
+    match str.index(greeting, "<")
+        None     => ""
+        Some(lo) =>
+            match str.index_from(greeting, ">", lo + 1)
+                None     => ""
+                Some(hi) =>
+                    let token = str.slice(greeting, lo, hi + 1)
+                    if shaped(token)
+                        token
+                    else
+                        ""
+
+// The digest an APOP command carries: the MD5 of the timestamp and the
+// secret, as 32 lower-case hex digits.
+//
+// ```novo
+// use pop3apop
+//
+// fn main() [io]
+//     let d = pop3apop.digest("<1896.697170952@dbc.mtview.ca.us>", "tanstaaf")
+//     println(d)   // c4c9334bac560ecc979e58001b3e22fb
+// ```
+pub fn digest(timestamp: Str, secret: Str) -> Str
+    bytes.to_hex(hashing.md5(bytes.from_str(timestamp + secret)))

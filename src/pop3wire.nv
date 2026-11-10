@@ -1,0 +1,329 @@
+// pop3wire.nv — the lines of POP3 as values and as bytes.
+//
+// THE FORMATS.  Every line ends in CRLF.  A command is a keyword and
+// zero or more arguments separated by single spaces (RFC 1939 section 3).
+// A reply begins with `+OK` or `-ERR`, then an optional space and text.
+// RFC 2449 section 8 lets the text begin with a response code in square
+// brackets: `-ERR [IN-USE] mailbox locked`.  During AUTH the server may
+// also send `+`, a space and base64 (RFC 5034 section 4): a challenge.
+//
+// A multi-line response is a reply line followed by lines up to one that
+// holds a single `.`.  A line of the body that begins with `.` has a
+// second `.` put in front of it (byte-stuffing, RFC 1939 section 3), and
+// `unstuff` takes it out.
+//
+// This module reads one line at a time and builds one command at a time.
+// The session in `pop3session` decides which line comes next.
+
+use std.bytes
+use std.str
+use pop3err
+
+// The longest status line, in octets with its CRLF: 512 (RFC 2449
+// section 4).
+pub const POP3_STATUS_MAX = 512
+// The longest command line, in octets with its CRLF: 255 (RFC 2449
+// section 4).
+pub const POP3_COMMAND_MAX = 255
+// The longest unique-id of a UIDL answer, in characters: 70 (RFC 1939
+// section 7).
+pub const POP3_UID_MAX = 70
+
+// A reply line, split into its parts.
+pub struct Pop3Status
+    // True for `+OK`, false for `-ERR` and for a `+` continuation.
+    ok: Bool
+    // True for the `+` line of an AUTH exchange.
+    continuation: Bool
+    // The response code between square brackets at the start of the
+    // text, without the brackets, or "".
+    code: Str
+    // The text after the keyword, the space and the response code.
+    text: Str
+
+// One message of a maildrop, as a LIST or a UIDL answer gives it.
+pub struct Pop3Entry
+    // The message number, from 1.
+    number: Int
+    // The size in octets from a LIST answer, or -1 in a UIDL entry.
+    size: Int
+    // The unique-id from a UIDL answer, or "" in a LIST entry.
+    uid: Str
+
+// One line of a CAPA answer: a name, upper-cased, and its arguments.
+pub struct Pop3Capability
+    // The first word of the line, upper-cased.
+    name: Str
+    // The words after it, as sent.
+    args: [Str]
+
+// The value of `s` when it is one to fifteen ASCII digits, and -1
+// otherwise.  A sign, a space or a digit more than fifteen is refused.
+fn number_of(s: Str) -> Int
+    let n = str.len(s)
+    if n < 1 or n > 15
+        return -1
+    var v = 0
+    for i in 0..n
+        let b = str.byte_at_or(s, i, 0)
+        if b < 48 or b > 57
+            return -1
+        v = v * 10 + (b - 48)
+    v
+
+// The text after `n` leading bytes, without one space if that is the
+// next byte.
+fn after_space(s: Str, n: Int) -> Str
+    if str.byte_at_or(s, n, 0) == 32
+        return str.slice(s, n + 1, str.len(s))
+    str.slice(s, n, str.len(s))
+
+// Split the text of a reply into its response code and the rest.
+fn split_code(text: Str) -> Pop3Status
+    if str.byte_at_or(text, 0, 0) != 91
+        return Pop3Status { ok: true, continuation: false, code: "", text: text }
+    match str.index(text, "]")
+        None     => Pop3Status { ok: true, continuation: false, code: "", text: text }
+        Some(at) => Pop3Status { ok: true, continuation: false, code: str.slice(text, 1, at),
+                                 text: after_space(text, at + 1) }
+
+// Read a reply line, with its CRLF already removed.
+//
+// `+OK` and `-ERR` are case-sensitive, as RFC 1939 section 3 writes
+// them, and must be followed by a space or the end of the line.  A `+`
+// followed by a space or the end of the line is the continuation of an
+// AUTH exchange and `text` holds the base64.  A response code is split
+// off the text.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_status("-ERR [IN-USE] mailbox locked")
+//         Ok(s)  => println("${s.ok} ${s.code} ${s.text}")   // false IN-USE mailbox locked
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_status(line: Str) -> Result<Pop3Status, Pop3Error>
+    let n = str.len(line)
+    if n > POP3_STATUS_MAX - 2
+        return Err(Pop3StatusTooLong(n))
+    if str.starts_with(line, "+OK") and (n == 3 or str.byte_at_or(line, 3, 0) == 32)
+        let s = split_code(after_space(line, 3))
+        return Ok(Pop3Status { ok: true, continuation: false, code: s.code, text: s.text })
+    if str.starts_with(line, "-ERR") and (n == 4 or str.byte_at_or(line, 4, 0) == 32)
+        let s = split_code(after_space(line, 4))
+        return Ok(Pop3Status { ok: false, continuation: false, code: s.code, text: s.text })
+    if str.starts_with(line, "+") and (n == 1 or str.byte_at_or(line, 1, 0) == 32)
+        return Ok(Pop3Status { ok: false, continuation: true, code: "", text: after_space(line, 1) })
+    Err(Pop3BadStatus(line))
+
+// Take the byte-stuffing out of one line of a multi-line response: a
+// line that begins `..` loses its first dot.  The terminator, a line of
+// one `.`, is the caller's to recognise first.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     println(pop3wire.unstuff("..hidden"))   // .hidden
+// ```
+pub fn unstuff(line: Str) -> Str
+    if str.starts_with(line, "..")
+        return str.slice(line, 1, str.len(line))
+    line
+
+// Read the text of a STAT answer: a message count and a size in octets
+// (RFC 1939 section 5).  Words after the second are ignored, as some
+// servers add text.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_stat("2 320")
+//         Ok(e)  => println("${e.number} ${e.size}")   // 2 320
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_stat(text: Str) -> Result<Pop3Entry, Pop3Error>
+    let w = str.words(text)
+    if list.len(w) < 2
+        return Err(Pop3BadStat(text))
+    let count = number_of(w[0])
+    let size = number_of(w[1])
+    if count < 0 or size < 0
+        return Err(Pop3BadStat(text))
+    Ok(Pop3Entry { number: count, size: size, uid: "" })
+
+// Read one LIST line: a message number from 1 and a size in octets
+// (RFC 1939 section 5).  The text of `LIST n` has the same shape, after
+// its `+OK`.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_list_line("1 120")
+//         Ok(e)  => println("${e.number} ${e.size}")   // 1 120
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_list_line(line: Str) -> Result<Pop3Entry, Pop3Error>
+    let w = str.words(line)
+    if list.len(w) < 2
+        return Err(Pop3BadListLine(line))
+    let number = number_of(w[0])
+    let size = number_of(w[1])
+    if number < 1 or size < 0
+        return Err(Pop3BadListLine(line))
+    Ok(Pop3Entry { number: number, size: size, uid: "" })
+
+// Whether every byte of a unique-id is a printable ASCII character from
+// 0x21 to 0x7E, as RFC 1939 section 7 requires, and it is 1 to 70 long.
+fn uid_valid(uid: Str) -> Bool
+    let n = str.len(uid)
+    if n < 1 or n > POP3_UID_MAX
+        return false
+    for i in 0..n
+        let b = str.byte_at_or(uid, i, 0)
+        if b < 33 or b > 126
+            return false
+    true
+
+// Read one UIDL line: a message number from 1 and a unique-id
+// (RFC 1939 section 7).
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_uidl_line("2 QhdPYR:00WBw1Ph7x7")
+//         Ok(e)  => println("${e.number} ${e.uid}")   // 2 QhdPYR:00WBw1Ph7x7
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_uidl_line(line: Str) -> Result<Pop3Entry, Pop3Error>
+    let w = str.words(line)
+    if list.len(w) != 2
+        return Err(Pop3BadUidlLine(line))
+    let number = number_of(w[0])
+    if number < 1 or not uid_valid(w[1])
+        return Err(Pop3BadUidlLine(line))
+    Ok(Pop3Entry { number: number, size: -1, uid: w[1] })
+
+// Read one line of a CAPA answer (RFC 2449 section 5): a capability name
+// and its arguments.  The name is upper-cased; the arguments are kept as
+// sent.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_capability("sasl PLAIN SCRAM-SHA-1")
+//         Ok(c)  => println("${c.name} ${list.len(c.args)}")   // SASL 2
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_capability(line: Str) -> Result<Pop3Capability, Pop3Error>
+    let w = str.words(line)
+    if list.len(w) == 0
+        return Err(Pop3BadCapability(line))
+    Ok(Pop3Capability { name: str.upper(w[0]), args: w[1:] })
+
+// Whether a CAPA answer lists `name`, compared without regard to case.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_capability("TOP")
+//         Ok(c)  => println("${pop3wire.has_capability([c], "top")}")   // true
+//         Err(e) => println(e.message())
+// ```
+pub fn has_capability(caps: [Pop3Capability], name: Str) -> Bool
+    let want = str.upper(name)
+    for c in caps
+        if c.name == want
+            return true
+    false
+
+// The arguments of the first capability called `name`, or an empty list
+// when it is not there.  `SASL` carries the mechanisms the server
+// offers for AUTH (RFC 5034 section 3).
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.parse_capability("SASL PLAIN CRAM-MD5")
+//         Ok(c)  => println(str.join(pop3wire.capability_args([c], "SASL"), ","))   // PLAIN,CRAM-MD5
+//         Err(e) => println(e.message())
+// ```
+pub fn capability_args(caps: [Pop3Capability], name: Str) -> [Str]
+    let want = str.upper(name)
+    for c in caps
+        if c.name == want
+            return c.args[:]
+    []
+
+// Whether a command argument may be sent: not empty, and without a CR,
+// an LF or a NUL.
+fn argument_ok(arg: Str) -> Bool
+    str.len(arg) > 0 and not str.contains(arg, "\r") and not str.contains(arg, "\n")
+        and not str.contains(arg, str.from_byte(0))
+
+// Build one command line: the keyword, each argument after a single
+// space, and a CRLF.
+//
+// Answers `Pop3BadArgument` for an argument that is empty or holds a CR,
+// an LF or a NUL, and `Pop3CommandTooLong` when the line with its CRLF
+// is over 255 octets.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.encode_command("TOP", ["1", "10"])
+//         Ok(b)  => println("${list.len(b)}")   // 10
+//         Err(e) => println(e.message())
+// ```
+pub fn encode_command(keyword: Str, args: [Str]) -> Result<[u8], Pop3Error>
+    for a in args
+        if not argument_ok(a)
+            return Err(Pop3BadArgument(keyword))
+    let text = if list.len(args) == 0
+        keyword
+    else
+        keyword + " " + str.join(args, " ")
+    let n = str.len(text) + 2
+    if n > POP3_COMMAND_MAX
+        return Err(Pop3CommandTooLong(n))
+    Ok(bytes.to_byte_list(bytes.from_str(text + "\r\n")))
+
+// Build one line of an AUTH exchange: the base64 of `data` and a CRLF.
+// Empty data gives a bare CRLF, which is how a client answers an empty
+// challenge (RFC 5034 section 4).
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     println("${list.len(pop3wire.encode_auth_data([1, 2, 3]))}")   // 6
+// ```
+pub fn encode_auth_data(data: [u8]) -> [u8]
+    let text = bytes.to_base64(bytes.from_byte_list(data))
+    bytes.to_byte_list(bytes.from_str(text + "\r\n"))
+
+// Read the base64 of a `+` challenge into the octets it stands for.  An
+// empty text is an empty challenge.
+//
+// ```novo
+// use pop3wire
+//
+// fn main() [io]
+//     match pop3wire.decode_auth_data("AQID")
+//         Ok(d)  => println("${list.len(d)}")   // 3
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_auth_data(text: Str) -> Result<[u8], Pop3Error>
+    if str.len(text) == 0
+        return Ok([])
+    match bytes.from_base64(text)
+        None    => Err(Pop3BadBase64(text))
+        Some(b) => Ok(bytes.to_byte_list(b))

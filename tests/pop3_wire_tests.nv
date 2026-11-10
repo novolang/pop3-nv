@@ -1,0 +1,261 @@
+// pop3_wire_tests.nv — the lines of POP3, one at a time.
+//
+// THE VECTORS come from RFC 1939 and RFC 2449, and the expected values
+// are the ones those documents print.  Where a case has no example in
+// the RFCs (a limit, a refusal) the comment above it says what rule it
+// tests.
+
+use std.bytes
+use std.str
+use std.test
+use pop3apop
+use pop3wire
+
+fn b(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+fn status_ok(line: Str) -> Pop3Status
+    match pop3wire.parse_status(line)
+        Ok(s)  => s
+        Err(e) => core.panic.panic(e.message())
+
+fn status_error(line: Str) -> Str
+    match pop3wire.parse_status(line)
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+@test
+fn test_status_lines_of_rfc_1939() [io]
+    test.case("+OK with text")
+    let a = status_ok("+OK 2 320")
+    test.assert(a.ok)
+    test.assert(not a.continuation)
+    test.assert_eq(a.text, "2 320")
+    test.assert_eq(a.code, "")
+
+    test.case("+OK alone and -ERR alone")
+    test.assert_eq(status_ok("+OK").text, "")
+    test.assert(status_ok("+OK").ok)
+    test.assert(not status_ok("-ERR").ok)
+    test.assert_eq(status_ok("-ERR").text, "")
+
+    test.case("-ERR with the text of RFC 1939 section 5")
+    let e = status_ok("-ERR no such message, only 2 messages in maildrop")
+    test.assert(not e.ok)
+    test.assert_eq(e.text, "no such message, only 2 messages in maildrop")
+
+    test.case("the keywords are case-sensitive and end at a space")
+    test.assert_eq(status_error("+ok 1"), "the line \"+ok 1\" is not a POP3 status line")
+    test.assert_eq(status_error("+OKAY"), "the line \"+OKAY\" is not a POP3 status line")
+    test.assert_eq(status_error("-ERRx"), "the line \"-ERRx\" is not a POP3 status line")
+    test.assert_eq(status_error("+x"), "the line \"+x\" is not a POP3 status line")
+    test.assert_eq(status_error(""), "the line \"\" is not a POP3 status line")
+
+@test
+fn test_response_codes_of_rfc_2449() [io]
+    // RFC 2449 section 8: the text of a response begins with a code in
+    // square brackets.
+    test.case("a code and its text")
+    let a = status_ok("-ERR [IN-USE] mailbox locked")
+    test.assert_eq(a.code, "IN-USE")
+    test.assert_eq(a.text, "mailbox locked")
+
+    test.case("a code with no text after it")
+    let b = status_ok("-ERR [LOGIN-DELAY]")
+    test.assert_eq(b.code, "LOGIN-DELAY")
+    test.assert_eq(b.text, "")
+
+    test.case("a hierarchical code on a +OK line")
+    let c = status_ok("+OK [SYS/TEMP] try later")
+    test.assert(c.ok)
+    test.assert_eq(c.code, "SYS/TEMP")
+
+    test.case("an opening bracket with no closing one is text")
+    let d = status_ok("-ERR [broken")
+    test.assert_eq(d.code, "")
+    test.assert_eq(d.text, "[broken")
+
+    test.case("a code directly followed by text with no space")
+    let f = status_ok("-ERR [AUTH]x")
+    test.assert_eq(f.code, "AUTH")
+    test.assert_eq(f.text, "x")
+
+@test
+fn test_continuation_lines_of_rfc_5034() [io]
+    test.case("+ and a space carry base64")
+    let a = status_ok("+ AQID")
+    test.assert(a.continuation)
+    test.assert(not a.ok)
+    test.assert_eq(a.text, "AQID")
+
+    test.case("a bare + is an empty challenge")
+    let b = status_ok("+")
+    test.assert(b.continuation)
+    test.assert_eq(b.text, "")
+
+@test
+fn test_a_status_line_is_at_most_512_octets_with_its_crlf() [io]
+    // RFC 2449 section 4: 512 octets, so 510 without the CRLF.
+    test.case("510 octets are read")
+    let text = str.repeat("x", 506)
+    test.assert_eq(status_ok("+OK " + text).text, text)
+    test.case("511 octets are refused")
+    test.assert_eq(status_error("+OK " + str.repeat("x", 507)), "a status line of 511 octets is over 512")
+
+@test
+fn test_byte_stuffing_of_rfc_1939_section_3() [io]
+    test.case("a doubled dot loses one")
+    test.assert_eq(pop3wire.unstuff("..hidden"), ".hidden")
+    test.assert_eq(pop3wire.unstuff(".."), ".")
+    test.case("other lines are unchanged")
+    test.assert_eq(pop3wire.unstuff(".single"), ".single")
+    test.assert_eq(pop3wire.unstuff("plain"), "plain")
+    test.assert_eq(pop3wire.unstuff(""), "")
+
+@test
+fn test_stat_answer() [io]
+    // RFC 1939 section 5: "+OK 2 320".
+    test.case("a count and a size")
+    match pop3wire.parse_stat("2 320")
+        Ok(e)  =>
+            test.assert_eq(e.number, 2)
+            test.assert_eq(e.size, 320)
+        Err(e) => test.assert_eq(e.message(), "")
+    test.case("text after the size is ignored")
+    match pop3wire.parse_stat("0 0 octets")
+        Ok(e)  => test.assert_eq(e.number, 0)
+        Err(e) => test.assert_eq(e.message(), "")
+    test.case("one number, a word, a sign and sixteen digits are refused")
+    for bad in ["2", "", "x 3", "2 y", "2 -3", "+2 3", "1234567890123456 3"]
+        match pop3wire.parse_stat(bad)
+            Ok(_)  => test.assert_eq(bad, "refused")
+            Err(e) => test.assert_eq(e.message(), "\"" + bad + "\" is not a message count and a size")
+
+@test
+fn test_list_lines() [io]
+    // RFC 1939 section 5: "1 120" and "2 200".
+    test.case("a number and a size")
+    match pop3wire.parse_list_line("2 200")
+        Ok(e)  =>
+            test.assert_eq(e.number, 2)
+            test.assert_eq(e.size, 200)
+            test.assert_eq(e.uid, "")
+        Err(e) => test.assert_eq(e.message(), "")
+    test.case("a missing size, number 0 and a letter are refused")
+    for bad in ["1", "0 5", "a 5", "1 b"]
+        match pop3wire.parse_list_line(bad)
+            Ok(_)  => test.assert_eq(bad, "refused")
+            Err(e) => test.assert_eq(e.message(), "\"" + bad + "\" is not a message number and a size")
+
+@test
+fn test_uidl_lines() [io]
+    // RFC 1939 section 7: "2 QhdPYR:00WBw1Ph7x7".
+    test.case("a number and a unique-id")
+    match pop3wire.parse_uidl_line("2 QhdPYR:00WBw1Ph7x7")
+        Ok(e)  =>
+            test.assert_eq(e.number, 2)
+            test.assert_eq(e.uid, "QhdPYR:00WBw1Ph7x7")
+            test.assert_eq(e.size, -1)
+        Err(e) => test.assert_eq(e.message(), "")
+    test.case("70 characters are read and 71 are refused")
+    match pop3wire.parse_uidl_line("1 " + str.repeat("a", 70))
+        Ok(e)  => test.assert_eq(str.len(e.uid), 70)
+        Err(e) => test.assert_eq(e.message(), "")
+    for bad in ["1 " + str.repeat("a", 71), "1", "1 a b", "0 abc", "x abc", "1 a" + str.from_byte(127)]
+        match pop3wire.parse_uidl_line(bad)
+            Ok(_)  => test.assert_eq(bad, "refused")
+            Err(e) => test.assert_eq(e.message(), "\"" + bad + "\" is not a message number and a unique-id")
+
+@test
+fn test_capabilities_of_rfc_2449() [io]
+    // RFC 2449 section 8 prints a CAPA answer: TOP, USER, SASL, RESP-CODES
+    // and so on.
+    test.case("a name is upper-cased and its arguments kept")
+    var caps: [Pop3Capability] = []
+    for line in ["TOP", "user", "SASL PLAIN SCRAM-SHA-1", "EXPIRE 60 USER", "LOGIN-DELAY 900"]
+        match pop3wire.parse_capability(line)
+            Ok(c)  => list.push(caps, c)
+            Err(e) => test.assert_eq(e.message(), "")
+    test.assert_eq(list.len(caps), 5)
+    test.assert_eq(caps[1].name, "USER")
+    test.assert_eq(str.join(caps[2].args, ","), "PLAIN,SCRAM-SHA-1")
+
+    test.case("a capability is found without regard to case")
+    test.assert(pop3wire.has_capability(caps, "top"))
+    test.assert(not pop3wire.has_capability(caps, "STLS"))
+
+    test.case("the arguments of a capability, or none")
+    test.assert_eq(str.join(pop3wire.capability_args(caps, "sasl"), " "), "PLAIN SCRAM-SHA-1")
+    test.assert_eq(list.len(pop3wire.capability_args(caps, "PIPELINING")), 0)
+
+    test.case("an empty line is not a capability")
+    match pop3wire.parse_capability("  ")
+        Ok(_)  => test.assert_eq("ok", "refused")
+        Err(e) => test.assert_eq(e.message(), "\"  \" is not a capability")
+
+fn command_text(keyword: Str, args: [Str]) -> Str
+    match pop3wire.encode_command(keyword, args)
+        Ok(x)  => bytes.byte_list_to_str(x)
+        Err(e) => e.message()
+
+@test
+fn test_commands() [io]
+    test.case("a keyword alone")
+    test.assert_eq(command_text("STAT", []), "STAT\r\n")
+    test.case("one argument and two")
+    test.assert_eq(command_text("USER", ["mrose"]), "USER mrose\r\n")
+    test.assert_eq(command_text("TOP", ["1", "10"]), "TOP 1 10\r\n")
+    test.case("a password may hold spaces")
+    test.assert_eq(command_text("PASS", ["a b c"]), "PASS a b c\r\n")
+
+    test.case("an empty argument or one with CR, LF or NUL is refused")
+    let refusal = "the USER is empty or holds a CR, an LF or a NUL"
+    test.assert_eq(command_text("USER", [""]), refusal)
+    test.assert_eq(command_text("USER", ["a\rb"]), refusal)
+    test.assert_eq(command_text("USER", ["a\nb"]), refusal)
+    test.assert_eq(command_text("USER", ["a" + str.from_byte(0)]), refusal)
+
+    // RFC 2449 section 4: 255 octets with the CRLF.
+    test.case("a line of 255 octets is built and 256 are refused")
+    test.assert_eq(str.len(command_text("USER", [str.repeat("x", 248)])), 255)
+    test.assert_eq(command_text("USER", [str.repeat("x", 249)]), "a command of 256 octets is over 255")
+
+@test
+fn test_auth_data_is_base64() [io]
+    // RFC 4648 section 10: "foobar" is "Zm9vYmFy".
+    test.case("octets to a line")
+    test.assert_eq(pop3wire.encode_auth_data(b("foobar")), b("Zm9vYmFy\r\n"))
+    test.assert_eq(pop3wire.encode_auth_data([]), b("\r\n"))
+    test.case("a text to octets")
+    match pop3wire.decode_auth_data("Zm9vYmFy")
+        Ok(d)  => test.assert_eq(d, b("foobar"))
+        Err(e) => test.assert_eq(e.message(), "")
+    match pop3wire.decode_auth_data("")
+        Ok(d)  => test.assert_eq(list.len(d), 0)
+        Err(e) => test.assert_eq(e.message(), "")
+    test.case("text that is not base64 is refused")
+    match pop3wire.decode_auth_data("***")
+        Ok(_)  => test.assert_eq("ok", "refused")
+        Err(e) => test.assert_eq(e.message(), "\"***\" is not base64")
+
+@test
+fn test_apop_digest_of_rfc_1939_section_7() [io]
+    // RFC 1939 section 7: the greeting carries
+    // <1896.697170952@dbc.mtview.ca.us>, the secret is "tanstaaf", and
+    // the digest is c4c9334bac560ecc979e58001b3e22fb.
+    test.case("the digest of the RFC's example")
+    test.assert_eq(pop3apop.digest("<1896.697170952@dbc.mtview.ca.us>", "tanstaaf"),
+                   "c4c9334bac560ecc979e58001b3e22fb")
+
+    test.case("the timestamp is found in a greeting")
+    test.assert_eq(pop3apop.timestamp_of("POP3 server ready <1896.697170952@dbc.mtview.ca.us>"),
+                   "<1896.697170952@dbc.mtview.ca.us>")
+    test.case("a greeting with no timestamp")
+    test.assert_eq(pop3apop.timestamp_of("POP3 server ready"), "")
+    test.assert_eq(pop3apop.timestamp_of("ready <unclosed"), "")
+    test.case("a bracketed token that is not shaped like a timestamp")
+    test.assert_eq(pop3apop.timestamp_of("<no at sign here>"), "")
+    test.assert_eq(pop3apop.timestamp_of("<a@b c>"), "")
+    test.assert_eq(pop3apop.timestamp_of("<a@b" + str.from_byte(13) + ">"), "")
+    test.assert_eq(pop3apop.timestamp_of("<a@b" + str.from_byte(10) + ">"), "")
+    test.assert_eq(pop3apop.timestamp_of("<a@b" + str.from_byte(0) + ">"), "")

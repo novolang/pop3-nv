@@ -1,0 +1,504 @@
+// pop3_session_tests.nv — the client session driven with bytes.
+//
+// THE DIALOGUES are the examples of RFC 1939 sections 5 to 7 and of
+// RFC 2449 and RFC 5034, with the server's lines byte for byte.  No test
+// opens a socket: the bytes the session writes are compared with the
+// command lines, and the bytes the server would send are handed to
+// `feed`.
+
+use std.bytes
+use std.str
+use std.test
+use pop3session
+use pop3wire
+
+fn b(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+fn txt(x: [u8]) -> Str
+    bytes.byte_list_to_str(x)
+
+fn names(entries: [Pop3Entry]) -> Str
+    str.join(list.map(entries, e => str.from_int(e.number) + ":" + str.from_int(e.size) + ":" + e.uid), ",")
+
+// One event as a short word, so that a test states what it expects as
+// text.
+fn show(e: Pop3Event) -> Str
+    match e
+        Pop3Greeting(t, ts)        => "greeting(" + t + "|" + ts + ")"
+        Pop3Authenticated(t)       => "authenticated(" + t + ")"
+        Pop3Reply(c, t)            => "reply(" + c + "|" + t + ")"
+        Pop3Refused(c, code, t)    => "refused(" + c + "|" + code + "|" + t + ")"
+        Pop3Stat(n, o)             => "stat(" + str.from_int(n) + "," + str.from_int(o) + ")"
+        Pop3Listing(es)            => "list(" + names(es) + ")"
+        Pop3UidListing(es)         => "uidl(" + names(es) + ")"
+        Pop3Message(c, n, body, t) => "message(" + c + "|" + str.from_int(n) + "|" + txt(body) + "|" + t + ")"
+        Pop3Capabilities(cs)       => "caps(" + str.join(list.map(cs, c => c.name), ",") + ")"
+        Pop3Challenge(d)           => "challenge(" + txt(d) + ")"
+        Pop3TlsReady               => "tls"
+        Pop3Bye(t)                 => "bye(" + t + ")"
+        Pop3Failed(err)            => "failed(" + err.message() + ")"
+
+fn shown(events: [Pop3Event]) -> Str
+    str.join(list.map(events, e => show(e)), " ")
+
+// A client that has read a `+OK` greeting with the RFC's timestamp.
+fn greeted() -> Pop3Client
+    var c = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    let _ev = pop3session.feed(var c, b("+OK POP3 server ready <1896.697170952@dbc.mtview.ca.us>\r\n"))
+    c
+
+// A client that has logged in with USER and PASS.
+fn logged_in() -> Pop3Client
+    logged_in_with(pop3session.POP3_BODY_DEFAULT)
+
+// The same, with a limit on one multi-line response.
+fn logged_in_with(limit: Int) -> Pop3Client
+    var c = pop3session.new_client(limit)
+    let _ev = pop3session.feed(var c, b("+OK POP3 server ready <1896.697170952@dbc.mtview.ca.us>\r\n"))
+    sent(var c, Pop3CmdUser("mrose"))
+    let _a = pop3session.feed(var c, b("+OK\r\n"))
+    sent(var c, Pop3CmdPass("secret"))
+    let _b = pop3session.feed(var c, b("+OK maildrop has 2 messages (320 octets)\r\n"))
+    c
+
+// Send a command and answer the text of the line.
+fn sent(var c: Pop3Client, cmd: Pop3Command)
+    match pop3session.send(var c, cmd)
+        Ok(_)  => 0
+        Err(e) => test.assert_eq(e.message(), "")
+
+fn line_of(var c: Pop3Client, cmd: Pop3Command) -> Str
+    match pop3session.send(var c, cmd)
+        Ok(x)  => txt(x)
+        Err(e) => "error: " + e.message()
+
+// A NUL, which a string literal cannot spell.
+fn nul_text() -> Str
+    str.from_byte(0)
+
+fn feed_text(var c: Pop3Client, s: Str) -> Str
+    shown(pop3session.feed(var c, b(s)))
+
+@test
+fn test_the_greeting_of_rfc_1939_section_7() [io]
+    test.case("the greeting and its timestamp")
+    var c = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    test.assert_eq(pop3session.phase_name(c.phase), "greeting")
+    test.assert_eq(feed_text(var c, "+OK POP3 server ready <1896.697170952@dbc.mtview.ca.us>\r\n"),
+                   "greeting(POP3 server ready <1896.697170952@dbc.mtview.ca.us>|<1896.697170952@dbc.mtview.ca.us>)")
+    test.assert_eq(pop3session.phase_name(c.phase), "authorization")
+
+    test.case("a greeting in pieces, one byte at a time")
+    var d = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    var all: [Str] = []
+    for ch in b("+OK hi\r\n")
+        list.push(all, shown(pop3session.feed(var d, [ch])))
+    test.assert_eq(str.join(all, "|"), "|||||||greeting(hi|)")
+
+    test.case("a greeting ended by a bare LF")
+    var e = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    test.assert_eq(feed_text(var e, "+OK ready\n"), "greeting(ready|)")
+
+    test.case("a refused greeting ends the session")
+    var f = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    test.assert_eq(feed_text(var f, "-ERR [SYS/TEMP] too many connections\r\n"),
+                   "refused(|SYS/TEMP|too many connections)")
+    test.assert_eq(pop3session.phase_name(f.phase), "ended")
+
+    test.case("a greeting that is not a status line")
+    var g = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    test.assert_eq(feed_text(var g, "220 smtp.example.com ESMTP\r\n"),
+                   "failed(the line \"220 smtp.example.com ESMTP\" is not a POP3 status line)")
+
+    test.case("a continuation as the greeting")
+    var h = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    test.assert_eq(feed_text(var h, "+ hello\r\n"), "failed(the line \"+ hello\" is not a POP3 status line)")
+
+@test
+fn test_user_and_pass() [io]
+    var c = greeted()
+    test.case("USER")
+    test.assert_eq(line_of(var c, Pop3CmdUser("mrose")), "USER mrose\r\n")
+    test.assert_eq(feed_text(var c, "+OK User name accepted, password please\r\n"),
+                   "reply(USER|User name accepted, password please)")
+    test.case("PASS")
+    test.assert_eq(line_of(var c, Pop3CmdPass("secret")), "PASS secret\r\n")
+    test.assert_eq(feed_text(var c, "+OK Mailbox open, 2 messages\r\n"),
+        "authenticated(Mailbox open, 2 messages)")
+    test.assert_eq(pop3session.phase_name(c.phase), "transaction")
+
+    test.case("PASS before an accepted USER is refused")
+    var d = greeted()
+    test.assert_eq(line_of(var d, Pop3CmdPass("x")),
+                   "error: PASS is not allowed in the authorization before USER state")
+    sent(var d, Pop3CmdUser("u"))
+    test.assert_eq(feed_text(var d, "-ERR no such user\r\n"), "refused(USER||no such user)")
+    test.assert_eq(line_of(var d, Pop3CmdPass("x")),
+                   "error: PASS is not allowed in the authorization before USER state")
+
+    test.case("a refused PASS lets the client start again with USER")
+    var e = greeted()
+    sent(var e, Pop3CmdUser("u"))
+    let _a = feed_text(var e, "+OK\r\n")
+    sent(var e, Pop3CmdPass("wrong"))
+    test.assert_eq(feed_text(var e, "-ERR [AUTH] invalid password\r\n"), "refused(PASS|AUTH|invalid password)")
+    test.assert_eq(pop3session.phase_name(e.phase), "authorization")
+    test.assert_eq(line_of(var e, Pop3CmdPass("again")),
+                   "error: PASS is not allowed in the authorization before USER state")
+    test.assert_eq(line_of(var e, Pop3CmdUser("u")), "USER u\r\n")
+
+@test
+fn test_apop_of_rfc_1939_section_7() [io]
+    // The session sends the digest of the greeting's timestamp and the
+    // secret, c4c9334bac560ecc979e58001b3e22fb for "tanstaaf".
+    var c = greeted()
+    test.assert_eq(line_of(var c, Pop3CmdApop("mrose", "tanstaaf")),
+                   "APOP mrose c4c9334bac560ecc979e58001b3e22fb\r\n")
+    test.assert_eq(feed_text(var c, "+OK maildrop has 1 message (369 octets)\r\n"),
+                   "authenticated(maildrop has 1 message (369 octets))")
+    test.assert_eq(pop3session.phase_name(c.phase), "transaction")
+
+    test.case("a greeting with no timestamp cannot be answered with APOP")
+    var d = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    let _ev = pop3session.feed(var d, b("+OK ready\r\n"))
+    test.assert_eq(line_of(var d, Pop3CmdApop("mrose", "tanstaaf")),
+                   "error: the greeting carried no timestamp, so APOP cannot be used")
+    test.assert_eq(line_of(var d, Pop3CmdNoop), "error: NOOP is not allowed in the authorization state")
+
+@test
+fn test_stat_list_and_retr_of_rfc_1939_section_5() [io]
+    var c = logged_in()
+    test.case("STAT")
+    test.assert_eq(line_of(var c, Pop3CmdStat), "STAT\r\n")
+    test.assert_eq(feed_text(var c, "+OK 2 320\r\n"), "stat(2,320)")
+
+    test.case("LIST of the whole maildrop")
+    test.assert_eq(line_of(var c, Pop3CmdList(0)), "LIST\r\n")
+    test.assert_eq(feed_text(var c, "+OK 2 messages (320 octets)\r\n1 120\r\n2 200\r\n.\r\n"),
+                   "list(1:120:,2:200:)")
+
+    test.case("LIST n")
+    test.assert_eq(line_of(var c, Pop3CmdList(2)), "LIST 2\r\n")
+    test.assert_eq(feed_text(var c, "+OK 2 200\r\n"), "list(2:200:)")
+    test.assert_eq(line_of(var c, Pop3CmdList(3)), "LIST 3\r\n")
+    test.assert_eq(feed_text(var c, "-ERR no such message, only 2 messages in maildrop\r\n"),
+                   "refused(LIST||no such message, only 2 messages in maildrop)")
+
+    test.case("RETR hands the message over as bytes")
+    test.assert_eq(line_of(var c, Pop3CmdRetr(1)), "RETR 1\r\n")
+    test.assert_eq(feed_text(var c, "+OK 120 octets\r\nSubject: hi\r\n\r\nbody\r\n.\r\n"),
+                   "message(RETR|1|Subject: hi\r\n\r\nbody\r\n|120 octets)")
+
+    test.case("DELE, NOOP and RSET")
+    test.assert_eq(line_of(var c, Pop3CmdDele(1)), "DELE 1\r\n")
+    test.assert_eq(feed_text(var c, "+OK message 1 deleted\r\n"), "reply(DELE|message 1 deleted)")
+    test.assert_eq(line_of(var c, Pop3CmdDele(2)), "DELE 2\r\n")
+    test.assert_eq(feed_text(var c, "-ERR message 2 already deleted\r\n"),
+                   "refused(DELE||message 2 already deleted)")
+    test.assert_eq(line_of(var c, Pop3CmdNoop), "NOOP\r\n")
+    test.assert_eq(feed_text(var c, "+OK\r\n"), "reply(NOOP|)")
+    test.assert_eq(line_of(var c, Pop3CmdRset), "RSET\r\n")
+    test.assert_eq(feed_text(var c, "+OK maildrop has 2 messages (320 octets)\r\n"),
+                   "reply(RSET|maildrop has 2 messages (320 octets))")
+
+@test
+fn test_top_and_uidl_of_rfc_1939_section_7() [io]
+    var c = logged_in()
+    test.case("TOP")
+    test.assert_eq(line_of(var c, Pop3CmdTop(1, 10)), "TOP 1 10\r\n")
+    test.assert_eq(feed_text(var c, "+OK\r\nReceived: x\r\n\r\nline one\r\n.\r\n"),
+                   "message(TOP|1|Received: x\r\n\r\nline one\r\n|)")
+    test.assert_eq(line_of(var c, Pop3CmdTop(100, 3)), "TOP 100 3\r\n")
+    test.assert_eq(feed_text(var c, "-ERR no such message\r\n"), "refused(TOP||no such message)")
+
+    test.case("UIDL for the whole maildrop")
+    test.assert_eq(line_of(var c, Pop3CmdUidl(0)), "UIDL\r\n")
+    test.assert_eq(feed_text(var c, "+OK\r\n1 whqtswO00WBw418f9t5JxYwZ\r\n2 QhdPYR:00WBw1Ph7x7\r\n.\r\n"),
+                   "uidl(1:-1:whqtswO00WBw418f9t5JxYwZ,2:-1:QhdPYR:00WBw1Ph7x7)")
+
+    test.case("UIDL n")
+    test.assert_eq(line_of(var c, Pop3CmdUidl(2)), "UIDL 2\r\n")
+    test.assert_eq(feed_text(var c, "+OK 2 QhdPYR:00WBw1Ph7x7\r\n"), "uidl(2:-1:QhdPYR:00WBw1Ph7x7)")
+    test.assert_eq(line_of(var c, Pop3CmdUidl(3)), "UIDL 3\r\n")
+    test.assert_eq(feed_text(var c, "-ERR no such message, only 2 messages in maildrop\r\n"),
+                   "refused(UIDL||no such message, only 2 messages in maildrop)")
+
+@test
+fn test_quit_of_rfc_1939_section_6() [io]
+    var c = logged_in()
+    test.assert_eq(line_of(var c, Pop3CmdQuit), "QUIT\r\n")
+    test.assert_eq(feed_text(var c, "+OK dewey POP3 server signing off (maildrop empty)\r\n"),
+                   "bye(dewey POP3 server signing off (maildrop empty))")
+    test.assert_eq(pop3session.phase_name(c.phase), "ended")
+    test.assert_eq(line_of(var c, Pop3CmdNoop), "error: NOOP is not allowed in the ended state")
+    test.assert_eq(feed_text(var c, "+OK\r\n"), "failed(the session has ended)")
+
+    test.case("QUIT in the authorization phase")
+    var d = greeted()
+    test.assert_eq(line_of(var d, Pop3CmdQuit), "QUIT\r\n")
+    test.assert_eq(feed_text(var d, "+OK bye\r\n"), "bye(bye)")
+
+@test
+fn test_message_bodies() [io]
+    test.case("byte-stuffed lines lose one dot")
+    var c = logged_in()
+    sent(var c, Pop3CmdRetr(1))
+    test.assert_eq(feed_text(var c, "+OK\r\nline\r\n..dot\r\n...\r\n.single\r\n..\r\n.\r\n"),
+                   "message(RETR|1|line\r\n.dot\r\n..\r\n.single\r\n.\r\n|)")
+
+    test.case("a body split at every byte")
+    var d = logged_in()
+    sent(var d, Pop3CmdRetr(2))
+    var seen: [Str] = []
+    for ch in b("+OK\r\nab\r\n.\r\n")
+        let s = shown(pop3session.feed(var d, [ch]))
+        if str.len(s) > 0
+            list.push(seen, s)
+    test.assert_eq(str.join(seen, "|"), "message(RETR|2|ab\r\n|)")
+
+    test.case("lines ended by a bare LF come out with CRLF")
+    var e = logged_in()
+    sent(var e, Pop3CmdRetr(1))
+    test.assert_eq(feed_text(var e, "+OK\nab\ncd\n.\n"), "message(RETR|1|ab\r\ncd\r\n|)")
+
+    test.case("an empty message")
+    var f = logged_in()
+    sent(var f, Pop3CmdRetr(1))
+    test.assert_eq(feed_text(var f, "+OK\r\n.\r\n"), "message(RETR|1||)")
+
+    test.case("the bytes of a body are kept as they are")
+    var g = logged_in()
+    sent(var g, Pop3CmdRetr(1))
+    let evs = pop3session.feed(var g, [43, 79, 75, 13, 10, 0, 255, 128, 13, 10, 46, 13, 10])
+    match evs[0]
+        Pop3Message(_, _, body, _) => test.assert_eq(body, [0, 255, 128, 13, 10])
+        _                          => test.assert_eq(shown(evs), "a message")
+
+    test.case("two replies in one read")
+    var h = logged_in()
+    sent(var h, Pop3CmdStat)
+    let one = pop3session.feed(var h, b("+OK 1 10\r\n"))
+    sent(var h, Pop3CmdNoop)
+    let two = pop3session.feed(var h, b("+OK\r\n"))
+    test.assert_eq(shown(one) + " " + shown(two), "stat(1,10) reply(NOOP|)")
+
+@test
+fn test_capabilities_of_rfc_2449() [io]
+    var c = greeted()
+    test.assert_eq(line_of(var c, Pop3CmdCapa), "CAPA\r\n")
+    test.assert_eq(feed_text(var c,
+        "+OK Capability list follows\r\nTOP\r\nUSER\r\nSASL PLAIN SCRAM-SHA-1\r\nSTLS\r\nRESP-CODES\r\n.\r\n"),
+                   "caps(TOP,USER,SASL,STLS,RESP-CODES)")
+    test.assert_eq(list.len(pop3session.capabilities(c)), 5)
+    test.assert(pop3wire.has_capability(pop3session.capabilities(c), "stls"))
+
+    test.case("a login forgets the capabilities")
+    sent(var c, Pop3CmdUser("u"))
+    let _a = feed_text(var c, "+OK\r\n")
+    sent(var c, Pop3CmdPass("p"))
+    let _b = feed_text(var c, "+OK\r\n")
+    test.assert_eq(list.len(pop3session.capabilities(c)), 0)
+
+    test.case("CAPA is allowed in the transaction phase")
+    test.assert_eq(line_of(var c, Pop3CmdCapa), "CAPA\r\n")
+
+    test.case("a refused CAPA")
+    var d = greeted()
+    sent(var d, Pop3CmdCapa)
+    test.assert_eq(feed_text(var d, "-ERR unknown command\r\n"), "refused(CAPA||unknown command)")
+
+@test
+fn test_stls_of_rfc_2595() [io]
+    var c = greeted()
+    sent(var c, Pop3CmdCapa)
+    let _a = feed_text(var c, "+OK\r\nSTLS\r\n.\r\n")
+    test.assert_eq(line_of(var c, Pop3CmdStls), "STLS\r\n")
+    test.assert_eq(feed_text(var c, "+OK Begin TLS negotiation\r\n"), "tls")
+    pop3session.tls_started(var c)
+    test.assert_eq(list.len(pop3session.capabilities(c)), 0)
+    test.assert_eq(pop3session.phase_name(c.phase), "authorization")
+    test.assert_eq(line_of(var c, Pop3CmdCapa), "CAPA\r\n")
+
+    test.case("STLS is not allowed once logged in")
+    var d = logged_in()
+    test.assert_eq(line_of(var d, Pop3CmdStls), "error: STLS is not allowed in the transaction state")
+
+@test
+fn test_auth_of_rfc_5034() [io]
+    // RFC 5034 section 4: the client names a mechanism, the server sends
+    // `+` and a challenge in base64, the client answers in base64, and the
+    // server ends with +OK or -ERR.
+    test.case("a challenge, its answer and the success")
+    var c = greeted()
+    test.assert_eq(line_of(var c, Pop3CmdAuth("PLAIN")), "AUTH PLAIN\r\n")
+    test.assert_eq(feed_text(var c, "+ \r\n"), "challenge()")
+    test.assert_eq(line_of(var c, Pop3CmdAuthReply(b(nul_text() + "mrose" + nul_text() + "secret"))),
+        "AG1yb3NlAHNlY3JldA==\r\n")
+    test.assert_eq(feed_text(var c, "+OK Maildrop locked and ready\r\n"),
+        "authenticated(Maildrop locked and ready)")
+    test.assert_eq(pop3session.phase_name(c.phase), "transaction")
+
+    test.case("two rounds, with a bare + for an empty challenge")
+    var d = greeted()
+    sent(var d, Pop3CmdAuth("CRAM-MD5"))
+    test.assert_eq(feed_text(var d, "+ Zm9vYmFy\r\n"), "challenge(foobar)")
+    sent(var d, Pop3CmdAuthReply(b("a")))
+    test.assert_eq(feed_text(var d, "+\r\n"), "challenge()")
+    test.assert_eq(line_of(var d, Pop3CmdAuthReply([])), "\r\n")
+    test.assert_eq(feed_text(var d, "-ERR [AUTH] bad\r\n"), "refused(AUTH|AUTH|bad)")
+    test.assert_eq(pop3session.phase_name(d.phase), "authorization")
+
+    test.case("an initial response, empty and not")
+    var e = greeted()
+    test.assert_eq(line_of(var e, Pop3CmdAuthInitial("PLAIN", b("foobar"))), "AUTH PLAIN Zm9vYmFy\r\n")
+    test.assert_eq(feed_text(var e, "+OK\r\n"), "authenticated()")
+    var f = greeted()
+    test.assert_eq(line_of(var f, Pop3CmdAuthInitial("SCRAM-SHA-1", [])), "AUTH SCRAM-SHA-1 =\r\n")
+
+    test.case("the client cancels with *")
+    var g = greeted()
+    sent(var g, Pop3CmdAuth("PLAIN"))
+    let _a = feed_text(var g, "+\r\n")
+    test.assert_eq(line_of(var g, Pop3CmdAuthCancel), "*\r\n")
+    test.assert_eq(feed_text(var g, "-ERR cancelled\r\n"), "refused(AUTH||cancelled)")
+
+    test.case("an answer with no challenge waiting")
+    var h = greeted()
+    test.assert_eq(line_of(var h, Pop3CmdAuthReply(b("x"))),
+        "error: AUTH is not allowed in the authorization state")
+    sent(var h, Pop3CmdAuth("PLAIN"))
+    test.assert_eq(line_of(var h, Pop3CmdAuthCancel), "error: AUTH is not allowed in the authorization state")
+
+    test.case("AUTH is not allowed once logged in")
+    var i = logged_in()
+    test.assert_eq(line_of(var i, Pop3CmdAuth("PLAIN")), "error: AUTH is not allowed in the transaction state")
+
+@test
+fn test_a_server_that_breaks_the_auth_exchange() [io]
+    test.case("a challenge that is not base64")
+    var c = greeted()
+    sent(var c, Pop3CmdAuth("PLAIN"))
+    test.assert_eq(feed_text(var c, "+ ***\r\n"), "failed(\"***\" is not base64)")
+
+    test.case("a second + before the client answered")
+    var d = greeted()
+    sent(var d, Pop3CmdAuth("PLAIN"))
+    let _a = feed_text(var d, "+ AQID\r\n")
+    test.assert_eq(feed_text(var d, "+ AQID\r\n"), "failed(the line \"+ AQID\" is not a POP3 status line)")
+
+    test.case("a + in answer to a command that is not AUTH")
+    var e = logged_in()
+    sent(var e, Pop3CmdStat)
+    test.assert_eq(feed_text(var e, "+ x\r\n"), "failed(the line \"+ x\" is not a POP3 status line)")
+
+@test
+fn test_commands_in_the_wrong_place() [io]
+    test.case("nothing before the greeting")
+    var c = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+    test.assert_eq(line_of(var c, Pop3CmdUser("x")), "error: USER is not allowed in the greeting state")
+
+    test.case("a second command while one is unanswered")
+    var d = greeted()
+    sent(var d, Pop3CmdCapa)
+    test.assert_eq(line_of(var d, Pop3CmdQuit), "error: QUIT cannot be sent while the last command is unanswered")
+
+    test.case("authorization commands in the transaction phase and the reverse")
+    var e = logged_in()
+    test.assert_eq(line_of(var e, Pop3CmdUser("x")), "error: USER is not allowed in the transaction state")
+    test.assert_eq(line_of(var e, Pop3CmdApop("x", "y")), "error: APOP is not allowed in the transaction state")
+    var f = greeted()
+    test.assert_eq(line_of(var f, Pop3CmdStat), "error: STAT is not allowed in the authorization state")
+    test.assert_eq(line_of(var f, Pop3CmdList(0)), "error: LIST is not allowed in the authorization state")
+
+    test.case("message numbers and line counts are checked")
+    var g = logged_in()
+    test.assert_eq(line_of(var g, Pop3CmdRetr(0)), "error: 0 is not a valid message number or line count")
+    test.assert_eq(line_of(var g, Pop3CmdDele(-1)), "error: -1 is not a valid message number or line count")
+    test.assert_eq(line_of(var g, Pop3CmdList(-2)), "error: -2 is not a valid message number or line count")
+    test.assert_eq(line_of(var g, Pop3CmdUidl(-3)), "error: -3 is not a valid message number or line count")
+    test.assert_eq(line_of(var g, Pop3CmdTop(0, 1)), "error: 0 is not a valid message number or line count")
+    test.assert_eq(line_of(var g, Pop3CmdTop(1, -1)), "error: -1 is not a valid message number or line count")
+    test.assert_eq(line_of(var g, Pop3CmdTop(1, 0)), "TOP 1 0\r\n")
+
+    test.case("a refused command leaves the session free")
+    var h = greeted()
+    test.assert_eq(line_of(var h, Pop3CmdUser("")), "error: the USER is empty or holds a CR, an LF or a NUL")
+    test.assert_eq(line_of(var h, Pop3CmdUser("u")), "USER u\r\n")
+
+@test
+fn test_a_server_that_sends_what_pop3_does_not() [io]
+    test.case("a malformed STAT answer")
+    var c = logged_in()
+    sent(var c, Pop3CmdStat)
+    test.assert_eq(feed_text(var c, "+OK none\r\n"), "failed(\"none\" is not a message count and a size)")
+    test.assert_eq(pop3session.phase_name(c.phase), "ended")
+
+    test.case("a malformed LIST n answer and a malformed UIDL n answer")
+    var d = logged_in()
+    sent(var d, Pop3CmdList(1))
+    test.assert_eq(feed_text(var d, "+OK 1\r\n"), "failed(\"1\" is not a message number and a size)")
+    var e = logged_in()
+    sent(var e, Pop3CmdUidl(1))
+    test.assert_eq(feed_text(var e, "+OK 1\r\n"), "failed(\"1\" is not a message number and a unique-id)")
+
+    test.case("a malformed line in a LIST, a UIDL and a CAPA answer")
+    var f = logged_in()
+    sent(var f, Pop3CmdList(0))
+    test.assert_eq(feed_text(var f, "+OK\r\nx y\r\n.\r\n"), "failed(\"x y\" is not a message number and a size)")
+    var g = logged_in()
+    sent(var g, Pop3CmdUidl(0))
+    test.assert_eq(feed_text(var g, "+OK\r\n1\r\n.\r\n"), "failed(\"1\" is not a message number and a unique-id)")
+    var h = greeted()
+    sent(var h, Pop3CmdCapa)
+    test.assert_eq(feed_text(var h, "+OK\r\n\r\n.\r\n"), "failed(\"\" is not a capability)")
+
+    test.case("a line when no command is waiting")
+    var i = logged_in()
+    test.assert_eq(feed_text(var i, "+OK surprise\r\n"),
+        "failed(the line \"+OK surprise\" arrived and no command was waiting)")
+
+    test.case("a status line that is not one")
+    var j = logged_in()
+    sent(var j, Pop3CmdNoop)
+    test.assert_eq(feed_text(var j, "OK\r\n"), "failed(the line \"OK\" is not a POP3 status line)")
+
+    test.case("bytes after a fault are refused")
+    test.assert_eq(feed_text(var j, "+OK\r\n"), "failed(the session has ended)")
+
+@test
+fn test_limits() [io]
+    // RFC 2449 section 4: a status line is at most 512 octets with its CRLF.
+    test.case("a status line that never ends")
+    var c = logged_in()
+    sent(var c, Pop3CmdNoop)
+    test.assert_eq(feed_text(var c, "+OK " + str.repeat("x", 520)),
+        "failed(a status line of 524 octets is over 512)")
+
+    test.case("a status line that ends too late")
+    var d = logged_in()
+    sent(var d, Pop3CmdNoop)
+    test.assert_eq(feed_text(var d, "+OK " + str.repeat("x", 520) + "\r\n"),
+                   "failed(a status line of 524 octets is over 512)")
+
+    test.case("a body over the limit, by lines")
+    var e = pop3session.new_client(20)
+    let _a = pop3session.feed(var e, b("+OK\r\n"))
+    sent(var e, Pop3CmdCapa)
+    let _b = pop3session.feed(var e, b("+OK\r\n"))
+    test.assert_eq(feed_text(var e, "0123456789\r\n0123456789\r\n"),
+                   "failed(the response is longer than the limit of 20 octets)")
+
+    test.case("a body over the limit, in one line with no end")
+    var f = pop3session.new_client(20)
+    let _c = pop3session.feed(var f, b("+OK\r\n"))
+    sent(var f, Pop3CmdCapa)
+    let _d = pop3session.feed(var f, b("+OK\r\n"))
+    test.assert_eq(feed_text(var f, str.repeat("x", 30)),
+                   "failed(the response is longer than the limit of 20 octets)")
+
+    test.case("a body exactly at the limit")
+    var g = logged_in_with(8)
+    sent(var g, Pop3CmdRetr(1))
+    let _f = pop3session.feed(var g, b("+OK\r\n"))
+    test.assert_eq(feed_text(var g, "123456\r\n.\r\n"), "message(RETR|1|123456\r\n|)")

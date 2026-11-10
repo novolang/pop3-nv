@@ -1,0 +1,616 @@
+// pop3session.nv — the client of RFC 1939 as a step a caller drives, with
+// no socket.
+//
+// THE LOOP is two calls.  `send` takes a command and answers the bytes to
+// write to the server.  `feed` takes the bytes that came from the server
+// and answers the events they completed.  The caller owns the socket, the
+// TLS around it and the clock.
+//
+// ONE COMMAND AT A TIME.  POP3 has no tags.  A reply belongs to the
+// command sent last, so `send` refuses a second command while the first
+// is unanswered, with `Pop3Busy`.  The exception is the pair of lines
+// that answer an AUTH challenge, which continue the AUTH in flight.
+//
+// THE PHASES are the three of RFC 1939 section 3.  Before the greeting
+// no command is allowed; in AUTHORIZATION the commands that log in are;
+// in TRANSACTION the commands on the maildrop are; after QUIT is
+// acknowledged, or after a fault, the session has ended.  A command sent
+// in the wrong phase is refused when it is sent, naming the phase.
+//
+// WHAT THE SESSION KEEPS: the phase, the bytes received that are not yet
+// a whole line, the command in flight, the timestamp of the greeting for
+// APOP, the capabilities the server last listed, and the body of a
+// multi-line response being gathered.  Capabilities are forgotten after
+// a login and after TLS starts, because RFC 2449 section 5 and RFC 2595
+// section 4 say they may have changed.
+//
+// BODIES.  A multi-line response is gathered whole and handed over as one
+// event.  Each line of it ends in CRLF in the bytes handed over, whatever
+// ended it on the wire, and the byte-stuffing is removed.  The total is
+// limited (`new_client`), and a response that goes over the limit ends
+// the session with `Pop3BodyTooLong`.
+//
+// A FAULT in the bytes ends the session: `feed` answers a `Pop3Failed`
+// event and every later call is refused.  A server's `-ERR` is not a
+// fault; it is a `Pop3Refused` event and the session carries on.
+
+use std.bytes
+use std.str
+use pop3apop
+use pop3err
+use pop3wire
+
+// The phase before the greeting has arrived.
+pub const POP3_PHASE_GREETING = 0
+// The phase in which the client logs in.
+pub const POP3_PHASE_AUTHORIZATION = 1
+// The phase in which the client works on the maildrop.
+pub const POP3_PHASE_TRANSACTION = 2
+// The phase after QUIT, a refused greeting or a fault.
+pub const POP3_PHASE_ENDED = 3
+
+// The default limit on one multi-line response, in octets: 64 MiB.
+pub const POP3_BODY_DEFAULT = 67108864
+
+// What the client sends.
+pub enum Pop3Command
+    // `USER name`.
+    Pop3CmdUser(name: Str)
+    // `PASS password`, valid after the server accepted a USER.
+    Pop3CmdPass(password: Str)
+    // `APOP name digest`, the digest made from the greeting's timestamp
+    // and `secret`.
+    Pop3CmdApop(name: Str, secret: Str)
+    // `STAT`.
+    Pop3CmdStat
+    // `LIST`, or `LIST n` for a message number from 1.  0 lists all.
+    Pop3CmdList(number: Int)
+    // `RETR n`.
+    Pop3CmdRetr(number: Int)
+    // `DELE n`.
+    Pop3CmdDele(number: Int)
+    // `NOOP`.
+    Pop3CmdNoop
+    // `RSET`.
+    Pop3CmdRset
+    // `TOP n lines`: the headers and the first `lines` lines of the body.
+    Pop3CmdTop(number: Int, lines: Int)
+    // `UIDL`, or `UIDL n`.  0 lists all.
+    Pop3CmdUidl(number: Int)
+    // `QUIT`.
+    Pop3CmdQuit
+    // `CAPA`.
+    Pop3CmdCapa
+    // `STLS`.  When the server agrees the caller starts TLS and then
+    // calls `tls_started`.
+    Pop3CmdStls
+    // `AUTH mechanism`, with no initial response.
+    Pop3CmdAuth(mechanism: Str)
+    // `AUTH mechanism response`, with the mechanism's first message.  An
+    // empty `initial` is sent as `=`.
+    Pop3CmdAuthInitial(mechanism: Str, initial: [u8])
+    // The answer to a challenge: the mechanism's next message.
+    Pop3CmdAuthReply(data: [u8])
+    // The line `*`, which cancels the exchange.
+    Pop3CmdAuthCancel
+
+// What the server's bytes completed.
+pub enum Pop3Event
+    // The greeting.  `timestamp` is the `<...>` token for APOP, or "".
+    Pop3Greeting(text: Str, timestamp: Str)
+    // A login succeeded (PASS, APOP or AUTH).  The phase is now
+    // TRANSACTION.
+    Pop3Authenticated(text: Str)
+    // A `+OK` for a command with nothing more to say: USER, DELE, NOOP
+    // and RSET.  `command` is its keyword.
+    Pop3Reply(command: Str, text: Str)
+    // A `-ERR`.  `code` is the RFC 2449 response code, or "".
+    Pop3Refused(command: Str, code: Str, text: Str)
+    // The answer to STAT.
+    Pop3Stat(count: Int, octets: Int)
+    // The answer to LIST.
+    Pop3Listing(entries: [Pop3Entry])
+    // The answer to UIDL.
+    Pop3UidListing(entries: [Pop3Entry])
+    // The answer to RETR or TOP: the message as bytes, each line ending
+    // in CRLF, without byte-stuffing and without the final `.` line.
+    // `text` is the rest of the `+OK` line.
+    Pop3Message(command: Str, number: Int, body: [u8], text: Str)
+    // The answer to CAPA.
+    Pop3Capabilities(capabilities: [Pop3Capability])
+    // A `+` line during AUTH, decoded from base64.
+    Pop3Challenge(data: [u8])
+    // The server agreed to STLS: start TLS now, then call `tls_started`.
+    Pop3TlsReady
+    // The server acknowledged QUIT.  The session has ended.
+    Pop3Bye(text: Str)
+    // The bytes were not POP3.  The session has ended.
+    Pop3Failed(error: Pop3Error)
+
+// The state of one connection.
+pub struct Pop3Client
+    // One of the `POP3_PHASE_` values.
+    var phase: Int
+    // The bytes received that do not yet make a whole line.
+    var inbuf: [u8]
+    // The keyword of the command in flight, or "".
+    var pending: Str
+    // The message number of the command in flight, 0 for none.
+    var pending_number: Int
+    // Whether an AUTH challenge has arrived and its reply has not been
+    // sent.
+    var challenged: Bool
+    // Whether the reply line of a multi-line response has been read.
+    var body_open: Bool
+    // The lines of a multi-line response so far.
+    var body: [u8]
+    // The `+OK` text of the line that opened the body.
+    var body_text: Str
+    // Whether the server accepted a USER and a PASS may follow.
+    var user_given: Bool
+    // The timestamp from the greeting, or "".
+    var timestamp: Str
+    // The capabilities from the last CAPA answer.
+    var caps: [Pop3Capability]
+    // The limit on one multi-line response, in octets.
+    max_body: Int
+
+// A session before the greeting.  `max_body` limits one multi-line
+// response in octets; `POP3_BODY_DEFAULT` is a reasonable value.
+//
+// ```novo
+// use pop3session
+//
+// fn main() [io]
+//     let c = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+//     println(pop3session.phase_name(c.phase))   // greeting
+// ```
+pub fn new_client(max_body: Int) -> Pop3Client
+    Pop3Client { phase: POP3_PHASE_GREETING, inbuf: [], pending: "", pending_number: 0,
+                 challenged: false, body_open: false, body: [], body_text: "",
+                 user_given: false, timestamp: "", caps: [], max_body: max_body }
+
+// The name of a phase, for a sentence.
+//
+// ```novo
+// use pop3session
+//
+// fn main() [io]
+//     println(pop3session.phase_name(pop3session.POP3_PHASE_TRANSACTION))   // transaction
+// ```
+pub fn phase_name(phase: Int) -> Str
+    match phase
+        0 => "greeting"
+        1 => "authorization"
+        2 => "transaction"
+        _ => "ended"
+
+// The capabilities the server listed in its last CAPA answer, or none
+// before one has arrived and after a login or the start of TLS.
+//
+// ```novo
+// use pop3session
+//
+// fn main() [io]
+//     let c = pop3session.new_client(1000)
+//     println("${list.len(pop3session.capabilities(c))}")   // 0
+// ```
+pub fn capabilities(c: Pop3Client) -> [Pop3Capability]
+    c.caps[:]
+
+// Tell the session that TLS has started after the server's `+OK` to
+// STLS.  The capabilities are forgotten, because the server may list
+// others now, and any bytes held from before TLS are dropped.
+//
+// ```novo
+// use pop3session
+//
+// fn main() [io]
+//     var c = pop3session.new_client(1000)
+//     pop3session.tls_started(var c)
+//     println(pop3session.phase_name(c.phase))   // greeting
+// ```
+pub fn tls_started(var c: Pop3Client)
+    c.caps = []
+    c.inbuf = []
+
+// The keyword of a command.
+fn keyword_of(cmd: Pop3Command) -> Str
+    match cmd
+        Pop3CmdUser(_)           => "USER"
+        Pop3CmdPass(_)           => "PASS"
+        Pop3CmdApop(_, _)        => "APOP"
+        Pop3CmdStat              => "STAT"
+        Pop3CmdList(_)           => "LIST"
+        Pop3CmdRetr(_)           => "RETR"
+        Pop3CmdDele(_)           => "DELE"
+        Pop3CmdNoop              => "NOOP"
+        Pop3CmdRset              => "RSET"
+        Pop3CmdTop(_, _)         => "TOP"
+        Pop3CmdUidl(_)           => "UIDL"
+        Pop3CmdQuit              => "QUIT"
+        Pop3CmdCapa              => "CAPA"
+        Pop3CmdStls              => "STLS"
+        Pop3CmdAuth(_)           => "AUTH"
+        Pop3CmdAuthInitial(_, _) => "AUTH"
+        Pop3CmdAuthReply(_)      => "AUTH"
+        Pop3CmdAuthCancel        => "AUTH"
+
+// The phase a command needs: 1 for AUTHORIZATION, 2 for TRANSACTION and
+// 0 for either.
+fn phase_needed(cmd: Pop3Command) -> Int
+    match cmd
+        Pop3CmdUser(_)           => POP3_PHASE_AUTHORIZATION
+        Pop3CmdPass(_)           => POP3_PHASE_AUTHORIZATION
+        Pop3CmdApop(_, _)        => POP3_PHASE_AUTHORIZATION
+        Pop3CmdStls              => POP3_PHASE_AUTHORIZATION
+        Pop3CmdAuth(_)           => POP3_PHASE_AUTHORIZATION
+        Pop3CmdAuthInitial(_, _) => POP3_PHASE_AUTHORIZATION
+        Pop3CmdCapa              => 0
+        Pop3CmdQuit              => 0
+        _                        => POP3_PHASE_TRANSACTION
+
+// A message number, which must be from 1.
+fn message_number(n: Int) -> Result<Str, Pop3Error>
+    if n < 1
+        return Err(Pop3BadNumber(n))
+    Ok(str.from_int(n))
+
+// The arguments of LIST and UIDL: none for 0, else the message number.
+fn optional_number(n: Int) -> Result<[Str], Pop3Error>
+    if n == 0
+        return Ok([])
+    Ok([message_number(n)!])
+
+// The AUTH line for a mechanism and an optional initial response.
+fn auth_line(mechanism: Str, initial: [u8], has_initial: Bool) -> Result<[u8], Pop3Error>
+    if not has_initial
+        return pop3wire.encode_command("AUTH", [mechanism])
+    if list.len(initial) == 0
+        return pop3wire.encode_command("AUTH", [mechanism, "="])
+    let text = bytes.to_base64(bytes.from_byte_list(initial))
+    pop3wire.encode_command("AUTH", [mechanism, text])
+
+// The line a command is sent as.
+fn encode(c: Pop3Client, cmd: Pop3Command) -> Result<[u8], Pop3Error>
+    match cmd
+        Pop3CmdUser(name)                      => pop3wire.encode_command("USER", [name])
+        Pop3CmdPass(password)                  => pop3wire.encode_command("PASS", [password])
+        Pop3CmdApop(name, secret)              =>
+            if str.len(c.timestamp) == 0
+                return Err(Pop3NoTimestamp)
+            pop3wire.encode_command("APOP", [name, pop3apop.digest(c.timestamp, secret)])
+        Pop3CmdStat                            => pop3wire.encode_command("STAT", [])
+        Pop3CmdList(n)                         => pop3wire.encode_command("LIST", optional_number(n)!)
+        Pop3CmdRetr(n)                         => pop3wire.encode_command("RETR", [message_number(n)!])
+        Pop3CmdDele(n)                         => pop3wire.encode_command("DELE", [message_number(n)!])
+        Pop3CmdNoop                            => pop3wire.encode_command("NOOP", [])
+        Pop3CmdRset                            => pop3wire.encode_command("RSET", [])
+        Pop3CmdTop(n, lines)                   =>
+            if lines < 0
+                return Err(Pop3BadNumber(lines))
+            pop3wire.encode_command("TOP", [message_number(n)!, str.from_int(lines)])
+        Pop3CmdUidl(n)                         => pop3wire.encode_command("UIDL", optional_number(n)!)
+        Pop3CmdQuit                            => pop3wire.encode_command("QUIT", [])
+        Pop3CmdCapa                            => pop3wire.encode_command("CAPA", [])
+        Pop3CmdStls                            => pop3wire.encode_command("STLS", [])
+        Pop3CmdAuth(mechanism)                 => auth_line(mechanism, [], false)
+        Pop3CmdAuthInitial(mechanism, initial) => auth_line(mechanism, initial, true)
+        Pop3CmdAuthReply(data)                 => Ok(pop3wire.encode_auth_data(data))
+        Pop3CmdAuthCancel                      => Ok(bytes.to_byte_list(bytes.from_str("*\r\n")))
+
+// The message number a command carries, for the events that name it.
+fn number_of(cmd: Pop3Command) -> Int
+    match cmd
+        Pop3CmdList(n)   => n
+        Pop3CmdRetr(n)   => n
+        Pop3CmdTop(n, _) => n
+        Pop3CmdUidl(n)   => n
+        _                => 0
+
+// Build the line for a command and note that its answer is awaited.
+//
+// Answers the bytes to write to the server.  A command in the wrong
+// phase is `Pop3WrongState`; one sent before the last was answered is
+// `Pop3Busy`; an argument with a CR, an LF or a NUL, an empty argument,
+// a message number below 1, a line over 255 octets, APOP with no
+// timestamp in the greeting are each refused by name, and the session is
+// unchanged. The two AUTH continuations are allowed only while a
+// challenge is waiting for its answer.
+//
+// ```novo
+// use pop3session
+//
+// fn main() [io]
+//     var c = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+//     let _e = pop3session.feed(var c, [43, 79, 75, 13, 10])
+//     match pop3session.send(var c, Pop3CmdUser("mrose"))
+//         Ok(b)  => println("${list.len(b)}")   // 12
+//         Err(e) => println(e.message())
+// ```
+pub fn send(var c: Pop3Client, cmd: Pop3Command) -> Result<[u8], Pop3Error>
+    let name = keyword_of(cmd)
+    if c.phase == POP3_PHASE_GREETING or c.phase == POP3_PHASE_ENDED
+        return Err(Pop3WrongState(name, phase_name(c.phase)))
+    if is_continuation(cmd)
+        if not c.challenged
+            return Err(Pop3WrongState(name, phase_name(c.phase)))
+        let line = encode(c, cmd)!
+        c.challenged = false
+        return Ok(line)
+    if str.len(c.pending) > 0
+        return Err(Pop3Busy(name))
+    let needed = phase_needed(cmd)
+    if needed != 0 and needed != c.phase
+        return Err(Pop3WrongState(name, phase_name(c.phase)))
+    if name == "PASS" and not c.user_given
+        return Err(Pop3WrongState(name, "authorization before USER"))
+    let line = encode(c, cmd)!
+    c.pending = name
+    c.pending_number = number_of(cmd)
+    Ok(line)
+
+// Whether a command continues an AUTH exchange rather than starting a
+// command.
+fn is_continuation(cmd: Pop3Command) -> Bool
+    match cmd
+        Pop3CmdAuthReply(_) => true
+        Pop3CmdAuthCancel   => true
+        _                   => false
+
+// End the session on a fault.
+fn fail(var c: Pop3Client, e: Pop3Error, var events: [Pop3Event])
+    c.phase = POP3_PHASE_ENDED
+    c.pending = ""
+    c.body_open = false
+    c.body = []
+    c.challenged = false
+    list.push(events, Pop3Failed(e))
+
+// The command in flight is answered.
+fn settle(var c: Pop3Client)
+    c.pending = ""
+    c.pending_number = 0
+    c.challenged = false
+    c.body_open = false
+
+// The text of bytes `lo` up to `hi` of the received buffer.
+fn text_of(buf: [u8], lo: Int, hi: Int) -> Str
+    bytes.byte_list_to_str(buf[lo:hi])
+
+// The lines of a gathered body, each without its CRLF.
+fn lines_of(body: [u8]) -> [Str]
+    let parts = str.split(bytes.byte_list_to_str(body), "\r\n")
+    parts[0:list.len(parts) - 1]
+
+// The entries of a LIST answer, or the first fault.
+fn list_entries(body: [u8]) -> Result<[Pop3Entry], Pop3Error>
+    var out: [Pop3Entry] = []
+    for line in lines_of(body)
+        list.push(out, pop3wire.parse_list_line(line)!)
+    Ok(out)
+
+// The entries of a UIDL answer, or the first fault.
+fn uidl_entries(body: [u8]) -> Result<[Pop3Entry], Pop3Error>
+    var out: [Pop3Entry] = []
+    for line in lines_of(body)
+        list.push(out, pop3wire.parse_uidl_line(line)!)
+    Ok(out)
+
+// The capabilities of a CAPA answer, or the first fault.
+fn capability_lines(body: [u8]) -> Result<[Pop3Capability], Pop3Error>
+    var out: [Pop3Capability] = []
+    for line in lines_of(body)
+        list.push(out, pop3wire.parse_capability(line)!)
+    Ok(out)
+
+// The event a finished multi-line response makes, or the fault in it.
+fn body_event(var c: Pop3Client) -> Result<Pop3Event, Pop3Error>
+    let cmd = c.pending
+    if cmd == "LIST"
+        return Ok(Pop3Listing(list_entries(c.body)!))
+    if cmd == "UIDL"
+        return Ok(Pop3UidListing(uidl_entries(c.body)!))
+    if cmd == "CAPA"
+        c.caps = capability_lines(c.body)!
+        return Ok(Pop3Capabilities(c.caps[:]))
+    Ok(Pop3Message(cmd, c.pending_number, c.body[:], c.body_text))
+
+// A line of a multi-line response.  Answers false when the session
+// ended.
+fn body_line(var c: Pop3Client, lo: Int, hi: Int, var events: [Pop3Event]) -> Bool
+    let n = hi - lo
+    if n == 1 and c.inbuf[lo] == 46
+        match body_event(var c)
+            Err(e) =>
+                fail(var c, e, var events)
+                return false
+            Ok(ev) =>
+                list.push(events, ev)
+        settle(var c)
+        return true
+    let skip = if n >= 2 and c.inbuf[lo] == 46 and c.inbuf[lo + 1] == 46
+        1
+    else
+        0
+    if list.len(c.body) + n - skip + 2 > c.max_body
+        fail(var c, Pop3BodyTooLong(c.max_body), var events)
+        return false
+    for i in lo + skip..hi
+        list.push(c.body, c.inbuf[i])
+    list.push(c.body, 13)
+    list.push(c.body, 10)
+    true
+
+// The `+OK` of the command in flight.  Answers false when the session
+// ended.
+fn accepted(var c: Pop3Client, s: pop3wire.Pop3Status, var events: [Pop3Event]) -> Bool
+    let cmd = c.pending
+    if cmd == "STAT"
+        match pop3wire.parse_stat(s.text)
+            Err(e) =>
+                fail(var c, e, var events)
+                return false
+            Ok(e)  =>
+                list.push(events, Pop3Stat(e.number, e.size))
+    elif (cmd == "LIST" or cmd == "UIDL") and c.pending_number > 0
+        let entry = if cmd == "LIST"
+            pop3wire.parse_list_line(s.text)
+        else
+            pop3wire.parse_uidl_line(s.text)
+        match entry
+            Err(e) =>
+                fail(var c, e, var events)
+                return false
+            Ok(e)  =>
+                if cmd == "LIST"
+                    list.push(events, Pop3Listing([e]))
+                else
+                    list.push(events, Pop3UidListing([e]))
+    elif cmd == "LIST" or cmd == "UIDL" or cmd == "RETR" or cmd == "TOP" or cmd == "CAPA"
+        c.body_open = true
+        c.body = []
+        c.body_text = s.text
+        return true
+    elif cmd == "PASS" or cmd == "APOP" or cmd == "AUTH"
+        c.phase = POP3_PHASE_TRANSACTION
+        c.user_given = false
+        c.caps = []
+        list.push(events, Pop3Authenticated(s.text))
+    elif cmd == "QUIT"
+        c.phase = POP3_PHASE_ENDED
+        list.push(events, Pop3Bye(s.text))
+    elif cmd == "STLS"
+        list.push(events, Pop3TlsReady)
+    else
+        if cmd == "USER"
+            c.user_given = true
+        list.push(events, Pop3Reply(cmd, s.text))
+    settle(var c)
+    true
+
+// A reply line for the command in flight.  Answers false when the
+// session ended.
+fn status_line(var c: Pop3Client, line: Str, var events: [Pop3Event]) -> Bool
+    match pop3wire.parse_status(line)
+        Err(e) =>
+            fail(var c, e, var events)
+            false
+        Ok(s)  =>
+            if s.continuation
+                return challenge(var c, s.text, line, var events)
+            if not s.ok
+                list.push(events, Pop3Refused(c.pending, s.code, s.text))
+                if c.pending == "PASS"
+                    c.user_given = false
+                settle(var c)
+                return true
+            accepted(var c, s, var events)
+
+// A `+` line: a challenge, valid only for an AUTH not already waiting
+// for its answer.
+fn challenge(var c: Pop3Client, text: Str, line: Str, var events: [Pop3Event]) -> Bool
+    if c.pending != "AUTH" or c.challenged
+        fail(var c, Pop3BadStatus(line), var events)
+        return false
+    match pop3wire.decode_auth_data(text)
+        Err(e)   =>
+            fail(var c, e, var events)
+            false
+        Ok(data) =>
+            c.challenged = true
+            list.push(events, Pop3Challenge(data))
+            true
+
+// The greeting.  Answers false when the session ended.
+fn greeting_line(var c: Pop3Client, line: Str, var events: [Pop3Event]) -> Bool
+    match pop3wire.parse_status(line)
+        Err(e) =>
+            fail(var c, e, var events)
+            false
+        Ok(s)  =>
+            if s.continuation
+                fail(var c, Pop3BadStatus(line), var events)
+                return false
+            if not s.ok
+                list.push(events, Pop3Refused("", s.code, s.text))
+                c.phase = POP3_PHASE_ENDED
+                return false
+            c.phase = POP3_PHASE_AUTHORIZATION
+            c.timestamp = pop3apop.timestamp_of(s.text)
+            list.push(events, Pop3Greeting(s.text, c.timestamp))
+            true
+
+// One line of the received buffer, bytes `lo` up to `hi`, CRLF removed.
+// Answers false when the session ended.
+fn take_line(var c: Pop3Client, lo: Int, hi: Int, var events: [Pop3Event]) -> Bool
+    if c.phase == POP3_PHASE_GREETING
+        return greeting_line(var c, text_of(c.inbuf, lo, hi), var events)
+    if str.len(c.pending) == 0
+        fail(var c, Pop3Unsolicited(text_of(c.inbuf, lo, hi)), var events)
+        return false
+    if c.body_open
+        return body_line(var c, lo, hi, var events)
+    status_line(var c, text_of(c.inbuf, lo, hi), var events)
+
+// The offset of the first LF at or after `from`, or -1.
+fn find_lf(buf: [u8], from: Int) -> Int
+    for i in from..list.len(buf)
+        if buf[i] == 10
+            return i
+    -1
+
+// A partial line has grown past what a line may be.
+fn check_partial(var c: Pop3Client, pos: Int, var events: [Pop3Event]) -> Bool
+    let rest = list.len(c.inbuf) - pos
+    if c.body_open and rest > c.max_body
+        fail(var c, Pop3BodyTooLong(c.max_body), var events)
+        return false
+    if not c.body_open and rest > pop3wire.POP3_STATUS_MAX
+        fail(var c, Pop3StatusTooLong(rest), var events)
+        return false
+    true
+
+// Hand the session bytes read from the server.
+//
+// Answers the events the bytes completed, in order, possibly none: a
+// read may hold half a line or several replies.  The session keeps what
+// is not yet a whole line.  Bytes after a fault or after the session has
+// ended are not read; the answer is one `Pop3Failed` naming
+// `Pop3Ended`.
+//
+// ```novo
+// use pop3session
+//
+// fn main() [io]
+//     var c = pop3session.new_client(pop3session.POP3_BODY_DEFAULT)
+//     let ev = pop3session.feed(var c, [43, 79, 75, 13, 10])
+//     println("${list.len(ev)}")   // 1
+// ```
+pub fn feed(var c: Pop3Client, data: [u8]) -> [Pop3Event]
+    var events: [Pop3Event] = []
+    if c.phase == POP3_PHASE_ENDED
+        list.push(events, Pop3Failed(Pop3Ended))
+        return events
+    for b in data
+        list.push(c.inbuf, b)
+    var pos = 0
+    var going = true
+    while going
+        let lf = find_lf(c.inbuf, pos)
+        if lf < 0
+            let _ok = check_partial(var c, pos, var events)
+            going = false
+        else
+            let hi = if lf > pos and c.inbuf[lf - 1] == 13
+                lf - 1
+            else
+                lf
+            let lo = pos
+            pos = lf + 1
+            going = take_line(var c, lo, hi, var events)
+    if c.phase == POP3_PHASE_ENDED
+        c.inbuf = []
+    else
+        c.inbuf = c.inbuf[pos:]
+    events
